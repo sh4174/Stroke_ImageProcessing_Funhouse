@@ -23,6 +23,9 @@ from monai.transforms import (
     Spacingd,
     RandRotate90d,
     ToTensord,
+    RandAdjustContrastd,
+    EnsureType,
+    EnsureTyped
 )
 
 from monai.config import print_config
@@ -49,7 +52,7 @@ print_config()
 
 
 # Output Directory
-model_dir = 'models/monai_unetr_lightning/'
+model_dir = 'models/monai_unetr_lightning_crop192/'
 os.makedirs( model_dir, exist_ok=True )
 
 # Set up Lightning Module
@@ -61,7 +64,7 @@ class UNetR_Module(pytorch_lightning.LightningModule):
         self._model = UNETR(
             in_channels=1,
             out_channels=2,
-            img_size=(96, 96, 16),
+            img_size=(192, 192, 16),
             feature_size=16,
             hidden_size=768,
             mlp_dim=3072,
@@ -74,15 +77,16 @@ class UNetR_Module(pytorch_lightning.LightningModule):
         ).to(device)
 
         self.loss_function = DiceCELoss(to_onehot_y=True, softmax=True)
-        self.post_pred = AsDiscrete(argmax=True, to_onehot=True, num_classes=2)
-        self.post_label = AsDiscrete(to_onehot=True, num_classes=2)
+        self.post_pred = Compose( [ EnsureType(), AsDiscrete(argmax=True, to_onehot=True, num_classes=2) ] )
+        self.post_label = Compose( [ EnsureType(), AsDiscrete(to_onehot=True, num_classes=2) ] )
         self.dice_metric = DiceMetric(
             include_background=False, reduction="mean", get_not_nans=False
         )
         self.best_val_dice = 0
         self.best_val_epoch = 0
-        # self.max_epochs = 2000
-        # self.check_val = 50
+        self.max_epochs = 2000
+        self.check_val = 50
+        self.warmup_epochs = 20
         self.metric_values = []
         self.epoch_loss_values = []
 
@@ -90,7 +94,8 @@ class UNetR_Module(pytorch_lightning.LightningModule):
         return self._model(x)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW( self._model.parameters(), lr=1e-4, weight_decay=1e-5 )
+        # optimizer = torch.optim.AdamW( self._model.parameters(), lr=1e-4, weight_decay=1e-5 )
+        optimizer = torch.optim.Adam( self._model.parameters(), lr=1e-4, weight_decay=1e-5 )
         return optimizer
 
 
@@ -108,7 +113,7 @@ class UNetR_Module(pytorch_lightning.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         images, labels = batch["image"], batch["label"]
-        roi_size = (96, 96, 16)
+        roi_size = (192, 192, 16)
         sw_batch_size = 8
         outputs = sliding_window_inference(
             images, roi_size, sw_batch_size, self.forward
@@ -145,10 +150,7 @@ class UNetR_Module(pytorch_lightning.LightningModule):
         return {"log": tensorboard_logs}
 
 
-
-
 # Main
-
 # initialise the LightningModule
 unetr_module = UNetR_Module()
 
@@ -181,13 +183,18 @@ train_transforms = Compose(
     [
         LoadImaged(keys=["image", "label"]),
         AddChanneld(keys=["image", "label"]),
+        RandAdjustContrastd( keys=["image"], prob=0.2 ),
         ScaleIntensityd(
             keys=["image"],
         ),
-        CropForegroundd(keys=["image", "label"], source_key="image"),
+        RandShiftIntensityd(
+            keys=["image"],
+            offsets=0.10,
+            prob=0.10,
+        ),
         RandSpatialCropd(
             keys=["image", "label"],
-            roi_size=(96, 96, 16),
+            roi_size=(192, 192, 16),
             random_size=False,
         ),
         RandFlipd(
@@ -195,24 +202,16 @@ train_transforms = Compose(
             spatial_axis=[0],
             prob=0.10,
         ),
-        RandShiftIntensityd(
-            keys=["image"],
-            offsets=0.10,
-            prob=0.50,
-        ),
-        # CropForegroundd(keys=["image", "label"], source_key="image"),
-        ToTensord(keys=["image", "label"]),
+        EnsureTyped(keys=["image", "label"]),
     ]
 )
 
 train_ds = CacheDataset(
     data=train_files,
     transform=train_transforms,
-    cache_num=24,
     cache_rate=1.0,
-    num_workers=1,
+    num_workers=8,
 )
-
 
 
 train_loader = torch.utils.data.DataLoader(
@@ -224,8 +223,6 @@ train_loader = torch.utils.data.DataLoader(
     collate_fn=list_data_collate,
 )
 
-
-
 # Validation
 val_transforms = Compose(
     [
@@ -234,16 +231,14 @@ val_transforms = Compose(
         ScaleIntensityd(
             keys=["image"],
         ),
-        # CropForegroundd(keys=["image", "label"], source_key="image"),
-        ToTensord(keys=["image", "label"]),
+        EnsureTyped(keys=["image", "label"]),
     ]
 )
 val_ds = CacheDataset(
     data=val_files,
     transform=val_transforms,
-    cache_num=6,
     cache_rate=1.0,
-    num_workers=1,
+    num_workers=4,
 )
 val_loader = torch.utils.data.DataLoader( val_ds, batch_size=4, shuffle=False, num_workers=4, pin_memory=True )
 
@@ -302,7 +297,7 @@ with torch.no_grad():
     val_inputs = torch.unsqueeze(img, 1).to(device)
     val_labels = torch.unsqueeze(label, 1).to(device)
     val_outputs = sliding_window_inference(
-        val_inputs, (96, 96, 16), 8, unetr_module, overlap=0.8
+        val_inputs, (192, 192, 16), 8, unetr_module, overlap=0.8
     )
     plt.figure("check", (18, 6))
     plt.subplot(1, 3, 1)
@@ -328,7 +323,7 @@ with torch.no_grad():
     val_inputs = torch.unsqueeze(img, 1).to(device)
     val_labels = torch.unsqueeze(label, 1).to(device)
     val_outputs = sliding_window_inference(
-        val_inputs, (96, 96, 16), 8, unetr_module.forward, overlap=0.8
+        val_inputs, (192, 192, 16), 8, unetr_module.forward, overlap=0.8
     )
     plt.figure("check", (18, 6))
     plt.subplot(1, 3, 1)
